@@ -40,18 +40,20 @@ function onOpen() {
   var ui = SpreadsheetApp.getUi();
   ui.createMenu('Outreach System')
     .addItem('Setup: Create All Sheets', 'setupAllSheets')
-    .addSeparator()
-    .addItem('Process: Leads Finder Pastes', 'processLeadsFinder')
-    .addItem('Process: LinkedIn Jobs Pastes', 'processLinkedInJobs')
-    .addItem('Process: Employees Pastes', 'processEmployees')
-    .addItem('Process: Signal Sources', 'processSignalSources')
-    .addSeparator()
-    .addItem('Run: Qualification Now', 'runQualification')
-    .addItem('Run: Process Replies Now', 'processNewReplies')
-    .addSeparator()
     .addItem('Setup: Create Triggers', 'setUpTriggers')
+    .addSeparator()
+    .addItem('▶ Run: Apify Ingestion Now', 'triggerApifyRuns')
+    .addItem('▶ Run: Qualification Now', 'runQualification')
+    .addItem('▶ Run: Process Replies Now', 'processNewReplies')
+    .addSeparator()
+    .addItem('Manual: Process Leads Finder Tab', 'processLeadsFinder')
+    .addItem('Manual: Process LinkedIn Jobs Tab', 'processLinkedInJobs')
+    .addItem('Manual: Process Employees Tab', 'processEmployees')
+    .addItem('Manual: Process Signal Sources Tab', 'processSignalSources')
+    .addSeparator()
     .addItem('Test: Config Check', 'testConfig')
     .addItem('Test: AI Clients', 'testAIClients')
+    .addItem('Test: Apify Connection', 'testApifyConnection')
     .addToUi();
 }
 
@@ -146,3 +148,44 @@ function testAIClients() {
     ui.alert('Error', 'AI Clients Test Failed: ' + e.message, ui.ButtonSet.OK);
   }
 }
+
+/**
+ * Automatically triggers reply drafting when a user enters/pastes text in the 'their_reply' column.
+ */
+function onEdit(e) {
+  try {
+    if (!e || !e.source) return;
+
+    var sheet = e.source.getActiveSheet();
+    var sheetName = sheet.getName();
+    var editedRow = e.range.getRow();
+    var editedCol = e.range.getColumn();
+
+    // Guard: only row 2 onwards (not header)
+    if (editedRow <= 1) return;
+
+    // LinkedIn reply handler: fires when 'their_reply' is edited in linkedin_queue
+    if (sheetName === 'linkedin_queue') {
+      var headers = getHeaders('linkedin_queue');
+      var theirReplyColIndex = headers.indexOf('their_reply') + 1;
+      if (editedCol === theirReplyColIndex) {
+        var newValue = e.value || e.range.getValue();
+        if (newValue && String(newValue).trim().length > 0) {
+          var rowData = {};
+          var allValues = sheet.getRange(editedRow, 1, 1, headers.length).getValues()[0];
+          for (var i = 0; i < headers.length; i++) {
+            rowData[headers[i]] = allValues[i];
+          }
+          if (rowData.contact_linkedin_url) {
+            handleLinkedInReplyEdit({rowNum: editedRow, data: rowData}, String(newValue).trim());
+          }
+        }
+      }
+    }
+
+  } catch (err) {
+    // onEdit must never throw — silent failure is better than breaking the sheet
+    Logger.log('onEdit error: ' + err.message);
+  }
+}
+

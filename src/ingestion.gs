@@ -328,3 +328,400 @@ function processSignalSources() {
     duration_seconds: duration
   });
 }
+
+/**
+ * Start an Apify actor run via REST API and return the run metadata.
+ */
+function runApifyActor(actorId, token, inputJson) {
+  try {
+    var url = 'https://api.apify.com/v2/acts/' + actorId + '/runs?token=' + token;
+    var options = {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(inputJson),
+      muteHttpExceptions: true
+    };
+    var response = UrlFetchApp.fetch(url, options);
+    var code = response.getResponseCode();
+    if (code !== 201) {
+      Logger.log('runApifyActor error (code ' + code + '): ' + response.getContentText());
+      return null;
+    }
+    var data = JSON.parse(response.getContentText());
+    return {
+      runId: data.data.id,
+      datasetId: data.data.defaultDatasetId
+    };
+  } catch (e) {
+    Logger.log('runApifyActor exception: ' + e.message);
+    return null;
+  }
+}
+
+/**
+ * Check if an Apify actor run is complete.
+ */
+function checkApifyRunStatus(runId, token) {
+  try {
+    var url = 'https://api.apify.com/v2/actor-runs/' + runId + '?token=' + token;
+    var options = {
+      method: 'get',
+      muteHttpExceptions: true
+    };
+    var response = UrlFetchApp.fetch(url, options);
+    var code = response.getResponseCode();
+    if (code !== 200) {
+      Logger.log('checkApifyRunStatus error (code ' + code + '): ' + response.getContentText());
+      return 'FAILED';
+    }
+    var data = JSON.parse(response.getContentText());
+    return data.data.status;
+  } catch (e) {
+    Logger.log('checkApifyRunStatus exception: ' + e.message);
+    return 'FAILED';
+  }
+}
+
+/**
+ * Fetch all results from a completed Apify run dataset.
+ */
+function fetchApifyDataset(datasetId, token) {
+  try {
+    var url = 'https://api.apify.com/v2/datasets/' + datasetId + '/items?token=' + token + '&format=json&clean=true&limit=200';
+    var options = {
+      method: 'get',
+      muteHttpExceptions: true
+    };
+    var response = UrlFetchApp.fetch(url, options);
+    var code = response.getResponseCode();
+    if (code !== 200) {
+      Logger.log('fetchApifyDataset error (code ' + code + '): ' + response.getContentText());
+      return [];
+    }
+    return JSON.parse(response.getContentText());
+  } catch (e) {
+    Logger.log('fetchApifyDataset exception: ' + e.message);
+    return [];
+  }
+}
+
+/**
+ * Start all Apify actor runs and schedule the polling check.
+ * Called by the Mon/Wed/Fri 6am time trigger.
+ */
+function triggerApifyRuns() {
+  var requiredKeys = [
+    'APIFY_TOKEN_LEADS', 'APIFY_LEADS_ACTOR_ID',
+    'APIFY_TOKEN_JOBS', 'APIFY_JOBS_ACTOR_ID',
+    'NOTIFICATION_EMAIL'
+  ];
+  
+  for (var i = 0; i < requiredKeys.length; i++) {
+    try {
+      getConfig(requiredKeys[i]);
+    } catch (err) {
+      var notificationEmail = '';
+      try {
+        notificationEmail = getConfig('NOTIFICATION_EMAIL');
+      } catch (e) {}
+      
+      if (notificationEmail) {
+        GmailApp.sendEmail(
+          notificationEmail,
+          'Apify ingestion failed: missing config key',
+          requiredKeys[i] + ' not found in config tab'
+        );
+      }
+      Logger.log('Apify ingestion failed: missing config key ' + requiredKeys[i]);
+      return;
+    }
+  }
+
+  // Build Leads Finder input from config
+  var jobTitles = [
+    'VP Supply Chain', 'Director of Logistics', 'Head of Transportation',
+    'VP Operations', 'Director Supply Chain', 'Logistics Manager',
+    'Transportation Manager', 'Director of Operations', 'CFO', 'VP Procurement'
+  ];
+  try {
+    var titlesStr = getConfig('TARGET_JOB_TITLES');
+    if (titlesStr) {
+      jobTitles = titlesStr.split(',').map(function(s) { return s.trim(); });
+    }
+  } catch (e) {
+    // fallback to hardcoded list if key is missing
+  }
+
+  var leadsInput = {
+    contact_job_title: jobTitles,
+    contact_location: getConfig('TARGET_LOCATIONS').split(',').map(function(s) { return s.trim(); }),
+    company_industry: getConfig('TARGET_INDUSTRIES').split(',').map(function(s) { return s.trim(); }),
+    min_revenue: 10000000,
+    max_revenue: 200000000,
+    email_status: ['validated'],
+    fetch_count: getConfigNumber('APIFY_FETCH_COUNT')
+  };
+
+  // Build LinkedIn Jobs input from config
+  var jobsInput = {
+    queries: getConfig('LINKEDIN_JOB_KEYWORDS').split(',').map(function(k) { return k.trim(); }),
+    locationName: 'United States',
+    datePosted: 'past-month'
+  };
+
+  // Start Leads Finder run
+  var leadsRun = runApifyActor(
+    getConfig('APIFY_LEADS_ACTOR_ID'),
+    getConfig('APIFY_TOKEN_LEADS'),
+    leadsInput
+  );
+
+  if (leadsRun === null) {
+    Logger.log('Apify Leads Finder run failed to start.');
+    GmailApp.sendEmail(
+      getConfig('NOTIFICATION_EMAIL'),
+      'Apify Leads Finder run failed to start',
+      'Check execution logs. Failed to start Leads Finder actor.'
+    );
+    return;
+  }
+
+  // Start LinkedIn Jobs run
+  var jobsRun = runApifyActor(
+    getConfig('APIFY_JOBS_ACTOR_ID'),
+    getConfig('APIFY_TOKEN_JOBS'),
+    jobsInput
+  );
+
+  if (jobsRun === null) {
+    Logger.log('Warning: Jobs run failed to start. Continuing with leads finder only.');
+  }
+
+  // Save to PropertiesService
+  var props = PropertiesService.getScriptProperties();
+  props.setProperty('APIFY_LEADS_RUN_ID', leadsRun.runId);
+  props.setProperty('APIFY_LEADS_DATASET_ID', leadsRun.datasetId);
+  props.setProperty('APIFY_LEADS_TOKEN', getConfig('APIFY_TOKEN_LEADS'));
+  
+  if (jobsRun !== null) {
+    props.setProperty('APIFY_JOBS_RUN_ID', jobsRun.runId);
+    props.setProperty('APIFY_JOBS_DATASET_ID', jobsRun.datasetId);
+    props.setProperty('APIFY_JOBS_TOKEN', getConfig('APIFY_TOKEN_JOBS'));
+  }
+  
+  props.setProperty('APIFY_POLL_ATTEMPTS', '0');
+
+  // Create delayed trigger for checkApifyAndProcess
+  var trigger = ScriptApp.newTrigger('checkApifyAndProcess')
+    .timeBased()
+    .after(4 * 60 * 1000)
+    .create();
+  props.setProperty('APIFY_CHECK_TRIGGER_ID', trigger.getUniqueId());
+
+  Logger.log('Apify runs started. Leads run: ' + leadsRun.runId + (jobsRun ? ', Jobs run: ' + jobsRun.runId : ''));
+}
+
+/**
+ * Poll Apify run status, fetch results when done, write to sheets.
+ * Called by delayed trigger from triggerApifyRuns() and recursively re-schedules itself.
+ */
+function checkApifyAndProcess() {
+  var props = PropertiesService.getScriptProperties();
+
+  // Delete the trigger that called this function
+  var triggerIdToDelete = props.getProperty('APIFY_CHECK_TRIGGER_ID');
+  if (triggerIdToDelete) {
+    var allTriggers = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < allTriggers.length; i++) {
+      if (allTriggers[i].getUniqueId() === triggerIdToDelete) {
+        ScriptApp.deleteTrigger(allTriggers[i]);
+      }
+    }
+    props.deleteProperty('APIFY_CHECK_TRIGGER_ID');
+  }
+
+  // Get run IDs and tokens
+  var leadsRunId = props.getProperty('APIFY_LEADS_RUN_ID');
+  var leadsDatasetId = props.getProperty('APIFY_LEADS_DATASET_ID');
+  var leadsToken = props.getProperty('APIFY_LEADS_TOKEN');
+  var jobsRunId = props.getProperty('APIFY_JOBS_RUN_ID');
+  var jobsDatasetId = props.getProperty('APIFY_JOBS_DATASET_ID');
+  var jobsToken = props.getProperty('APIFY_JOBS_TOKEN');
+
+  if (!leadsRunId) {
+    Logger.log('No pending Apify runs found — nothing to check');
+    return;
+  }
+
+  // Increment poll attempts
+  var attempts = parseInt(props.getProperty('APIFY_POLL_ATTEMPTS') || '0', 10) + 1;
+  props.setProperty('APIFY_POLL_ATTEMPTS', attempts.toString());
+  var maxAttempts = getConfigNumber('APIFY_MAX_POLL_ATTEMPTS');
+
+  if (attempts > maxAttempts) {
+    Logger.log('Max poll attempts reached — Apify runs may have timed out');
+    GmailApp.sendEmail(
+      getConfig('NOTIFICATION_EMAIL'),
+      'Apify runs timed out after ' + maxAttempts + ' checks',
+      'Runs did not complete within expected time. Check Apify dashboard.'
+    );
+    clearApifyProperties(props);
+    return;
+  }
+
+  // Check leads run status
+  var leadsStatus = checkApifyRunStatus(leadsRunId, leadsToken);
+  Logger.log('Attempt ' + attempts + ': Leads status = ' + leadsStatus);
+
+  // Check jobs run status (if exists)
+  var jobsStatus = jobsRunId ? checkApifyRunStatus(jobsRunId, jobsToken) : 'SUCCEEDED';
+  if (jobsRunId) {
+    Logger.log('Jobs status = ' + jobsStatus);
+  }
+
+  // If any run is still running or ready
+  if (leadsStatus === 'RUNNING' || leadsStatus === 'READY' || jobsStatus === 'RUNNING' || jobsStatus === 'READY') {
+    // Schedule next check
+    var nextTrigger = ScriptApp.newTrigger('checkApifyAndProcess')
+      .timeBased()
+      .after(4 * 60 * 1000)
+      .create();
+    props.setProperty('APIFY_CHECK_TRIGGER_ID', nextTrigger.getUniqueId());
+    Logger.log('Still running. Next check in 4 minutes.');
+    return;
+  }
+
+  // If leads run failed
+  if (leadsStatus !== 'SUCCEEDED') {
+    GmailApp.sendEmail(
+      getConfig('NOTIFICATION_EMAIL'),
+      'Apify Leads Finder run FAILED',
+      'Run ID: ' + leadsRunId + '. Status: ' + leadsStatus + '. Check Apify dashboard.'
+    );
+    clearApifyProperties(props);
+    return;
+  }
+
+  // Leads dataset processing
+  var leadsItems = fetchApifyDataset(leadsDatasetId, leadsToken);
+  Logger.log('Fetched ' + leadsItems.length + ' leads from Leads Finder');
+
+  var leadsWritten = 0;
+  var leadsDups = 0;
+
+  for (var k = 0; k < leadsItems.length; k++) {
+    var item = leadsItems[k];
+    var mapped = mapLeadsFinderRow(item);
+    
+    if (isDuplicate(mapped)) {
+      leadsDups++;
+      continue;
+    }
+    
+    item._processed = '';
+    item._processed_at = '';
+    appendRow('raw_leads_finder', item);
+    leadsWritten++;
+  }
+  Logger.log('Written ' + leadsWritten + ' new leads, ' + leadsDups + ' duplicates skipped');
+
+  // Jobs dataset processing
+  var jobsItemsCount = 0;
+  if (jobsRunId && jobsStatus === 'SUCCEEDED') {
+    var jobsItems = fetchApifyDataset(jobsDatasetId, jobsToken);
+    Logger.log('Fetched ' + jobsItems.length + ' LinkedIn job postings');
+    jobsItemsCount = jobsItems.length;
+    
+    for (var m = 0; m < jobsItems.length; m++) {
+      var jobItem = jobsItems[m];
+      appendRow('raw_linkedin_jobs', {
+        position: jobItem.position || jobItem.title || '',
+        company: jobItem.company || jobItem.companyName || '',
+        companyLinkedInUrl: jobItem.companyLinkedInUrl || jobItem.companyUrl || '',
+        location: jobItem.location || '',
+        salary: jobItem.salary || '',
+        postedAt: jobItem.postedAt || jobItem.publishedAt || '',
+        jobUrl: jobItem.jobUrl || jobItem.url || '',
+        description: jobItem.description || jobItem.descriptionText || '',
+        _processed: '',
+        _processed_at: '',
+        _contact_needed: '',
+        _employees_run_id: ''
+      });
+    }
+    
+    if (jobsItems.length > 0) {
+      Logger.log('LinkedIn jobs field names check keys: ' + Object.keys(jobsItems[0]).join(', '));
+    }
+  }
+
+  // Run processing functions immediately
+  Logger.log('Starting processing of fetched data...');
+  processLeadsFinder();
+  processLinkedInJobs();
+  Logger.log('Processing complete.');
+
+  // Clean up
+  clearApifyProperties(props);
+
+  // Send summary email
+  GmailApp.sendEmail(
+    getConfig('NOTIFICATION_EMAIL'),
+    'Apify Ingestion Complete: ' + leadsWritten + ' leads',
+    'Leads Finder: ' + leadsItems.length + ' fetched (' + leadsWritten + ' written, ' + leadsDups + ' duplicates skipped)\n' +
+    'LinkedIn Jobs: ' + jobsItemsCount + ' fetched\n\n' +
+    'Check your sheet — linkedin_queue will update after next qualification run.\n' +
+    'Run qualification manually from the menu: Run: Qualification Now'
+  );
+}
+
+/**
+ * Clean up PropertiesService after a run completes or fails.
+ */
+function clearApifyProperties(props) {
+  props.deleteProperty('APIFY_LEADS_RUN_ID');
+  props.deleteProperty('APIFY_LEADS_DATASET_ID');
+  props.deleteProperty('APIFY_LEADS_TOKEN');
+  props.deleteProperty('APIFY_JOBS_RUN_ID');
+  props.deleteProperty('APIFY_JOBS_DATASET_ID');
+  props.deleteProperty('APIFY_JOBS_TOKEN');
+  props.deleteProperty('APIFY_POLL_ATTEMPTS');
+  props.deleteProperty('APIFY_CHECK_TRIGGER_ID');
+}
+
+/**
+ * Test that Apify API tokens are valid without starting a real run.
+ */
+function testApifyConnection() {
+  var ui = SpreadsheetApp.getUi();
+  var results = [];
+  var tokens = [
+    { key: 'APIFY_TOKEN_LEADS', label: 'Leads' },
+    { key: 'APIFY_TOKEN_JOBS', label: 'Jobs' },
+    { key: 'APIFY_TOKEN_EMPLOYEES', label: 'Employees' }
+  ];
+  
+  for (var i = 0; i < tokens.length; i++) {
+    var t = tokens[i];
+    try {
+      var token = getConfig(t.key);
+      var url = 'https://api.apify.com/v2/users/me?token=' + token;
+      var response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+      var code = response.getResponseCode();
+      if (code === 200) {
+        var data = JSON.parse(response.getContentText());
+        results.push('✓ ' + t.label + ' Token valid. User: ' + data.data.username);
+        Logger.log('Token valid: ' + token.substring(0, 8) + '...');
+      } else {
+        results.push('✗ ' + t.label + ' Token INVALID. Response: ' + response.getContentText().substring(0, 100));
+        Logger.log('Token INVALID: ' + token.substring(0, 8) + '...');
+      }
+    } catch (e) {
+      results.push('✗ ' + t.label + ' Error: ' + e.message);
+      Logger.log('Token connection test failed for ' + t.key + ': ' + e.message);
+    }
+  }
+  
+  ui.alert('Apify Connection Test Results', results.join('\n'), ui.ButtonSet.OK);
+}
+
